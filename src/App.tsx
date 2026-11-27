@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Bot,
@@ -48,17 +48,20 @@ const TONE_BADGE: Record<string, string> = {
 export function App() {
   const [profile, setProfile] = useState<HouseholdProfile>(DEFAULT_PROFILE);
   const [useLiveFeed, setUseLiveFeed] = useState(false);
-  const [location, setLocation] = useState<LocationProfile>(() => resolveLocation(DEFAULT_PROFILE));
-  const [plan, setPlan] = useState<AssistantPlan>(() => buildScientificPlan(DEFAULT_PROFILE));
-  const [selectedIds, setSelectedIds] = useState<string[]>(() => {
-    const initPlan = buildScientificPlan(DEFAULT_PROFILE);
-    return [
+  const [initialState] = useState(() => {
+    const initLocation = resolveLocation(DEFAULT_PROFILE);
+    const initPlan = buildScientificPlan(DEFAULT_PROFILE, initLocation);
+    const initSelected = [
       initPlan.routines[0]?.id,
       initPlan.routines[1]?.id,
       initPlan.iaqHacks[0]?.id,
       initPlan.sustainableAlternatives[0]?.id,
     ].filter((id): id is string => Boolean(id));
+    return { initLocation, initPlan, initSelected };
   });
+  const [location, setLocation] = useState<LocationProfile>(initialState.initLocation);
+  const [plan, setPlan] = useState<AssistantPlan>(initialState.initPlan);
+  const [selectedIds, setSelectedIds] = useState<string[]>(initialState.initSelected);
   const [communityFamilies, setCommunityFamilies] = useState(25);
   const [activeTab, setActiveTab] = useState<TabId>('routines');
 
@@ -80,15 +83,16 @@ export function App() {
   const [isKeyModalOpen, setIsKeyModalOpen] = useState(false);
 
   const [isGenerating, setIsGenerating] = useState(false);
-  const [statusNote, setStatusNote] = useState<string>('');
+  const [statusNote, setStatusNote] = useState<string>('Using curated regional winter smog model.');
   const [warningNote, setWarningNote] = useState<string>('');
   const [geminiSuccessNote, setGeminiSuccessNote] = useState<string>('');
+  const planAbortRef = useRef<AbortController | null>(null);
 
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [isChatSending, setIsChatSending] = useState(false);
   const [copiedDraft, setCopiedDraft] = useState(false);
 
-  const fetchHealth = useCallback(async (keyOverride?: string, modelOverride?: string) => {
+  const fetchHealth = useCallback(async (keyOverride?: string, modelOverride?: string): Promise<boolean> => {
     try {
       const headers: Record<string, string> = {};
       const effective = keyOverride ?? geminiKey;
@@ -97,16 +101,22 @@ export function App() {
       if (effectiveModel) headers['x-gemini-model'] = effectiveModel;
       const res = await fetch('/api/health', { headers });
       if (res.ok) {
-        const data = (await res.json()) as { geminiSource?: string };
+        const data = (await res.json()) as { geminiSource?: string; geminiConfigured?: boolean };
         setServerHasEnvKey(data.geminiSource === 'env');
+        return Boolean(data.geminiConfigured);
       }
     } catch {
       // Offline / static fallback
     }
+    return false;
   }, [geminiKey, geminiModel]);
 
   const regeneratePlan = useCallback(
     async (nextProfile: HouseholdProfile, liveFlag: boolean, keyOverride?: string, modelOverride?: string) => {
+      planAbortRef.current?.abort();
+      const controller = new AbortController();
+      planAbortRef.current = controller;
+
       setIsGenerating(true);
       setWarningNote('');
       setGeminiSuccessNote('');
@@ -121,6 +131,7 @@ export function App() {
           method: 'POST',
           headers,
           body: JSON.stringify({ profile: nextProfile, useLiveFeed: liveFlag }),
+          signal: controller.signal,
         });
 
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -157,22 +168,34 @@ export function App() {
             data.plan.sustainableAlternatives[0]?.id,
           ].filter((id): id is string => Boolean(id));
         });
-      } catch {
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          return;
+        }
         const fallbackLoc = resolveLocation(nextProfile);
         const fallbackPlan = buildScientificPlan(nextProfile, fallbackLoc);
         setLocation(fallbackLoc);
         setPlan(fallbackPlan);
         setStatusNote('Running local scientific smog model.');
       } finally {
-        setIsGenerating(false);
+        if (planAbortRef.current === controller) {
+          setIsGenerating(false);
+        }
       }
     },
-    [geminiKey]
+    [geminiKey, geminiModel]
   );
 
   useEffect(() => {
-    void fetchHealth();
-    void regeneratePlan(DEFAULT_PROFILE, false);
+    void (async () => {
+      const geminiConfigured = await fetchHealth();
+      if (geminiConfigured || geminiKey) {
+        void regeneratePlan(DEFAULT_PROFILE, false);
+      }
+    })();
+    return () => {
+      planAbortRef.current?.abort();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

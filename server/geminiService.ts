@@ -100,6 +100,30 @@ export function parseJsonLenient<T>(rawText: string): T {
   return JSON.parse(jsonText) as T;
 }
 
+async function postGeminiJson<T>(
+  url: string,
+  apiKey: string,
+  payload: unknown
+): Promise<{ ok: boolean; status: number; data: T }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 25000);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    const data = (await res.json()) as T;
+    return { ok: res.ok, status: res.status, data };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function callGeminiInteractions(
   apiKey: string,
   model: string,
@@ -107,53 +131,40 @@ async function callGeminiInteractions(
   input: string,
   expectJson = true
 ): Promise<{ text: string; interactionId?: string }> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 25000);
+  const body: Record<string, unknown> = {
+    model,
+    system_instruction: systemInstruction,
+    input,
+    store: false,
+  };
 
-  try {
-    const body: Record<string, unknown> = {
-      model,
-      system_instruction: systemInstruction,
-      input,
-      store: false,
+  if (expectJson) {
+    body.response_format = {
+      type: 'text',
+      mime_type: 'application/json',
     };
-
-    if (expectJson) {
-      body.response_format = {
-        type: 'text',
-        mime_type: 'application/json',
-      };
-    }
-
-    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-
-    const data = (await res.json()) as InteractionsApiResponse;
-
-    if (!res.ok) {
-      // Fallback to generateContent if an older custom model doesn't support Interactions API
-      if (res.status === 404 || (data.error?.message || '').toLowerCase().includes('interactions')) {
-        const legacyText = await callGeminiGenerateContent(apiKey, model, systemInstruction, input, expectJson);
-        return { text: legacyText };
-      }
-      throw new Error(data.error?.message || `Gemini Interactions API returned HTTP ${res.status}`);
-    }
-
-    const text = extractTextFromGeminiPayload(data);
-    if (!text) {
-      throw new Error('Empty response from Gemini Interactions API');
-    }
-    return { text, interactionId: data.id };
-  } finally {
-    clearTimeout(timer);
   }
+
+  const { ok, status, data } = await postGeminiJson<InteractionsApiResponse>(
+    'https://generativelanguage.googleapis.com/v1beta/interactions',
+    apiKey,
+    body
+  );
+
+  if (!ok) {
+    // Fallback to generateContent if an older custom model doesn't support Interactions API
+    if (status === 404 || (data.error?.message || '').toLowerCase().includes('interactions')) {
+      const legacyText = await callGeminiGenerateContent(apiKey, model, systemInstruction, input, expectJson);
+      return { text: legacyText };
+    }
+    throw new Error(data.error?.message || `Gemini Interactions API returned HTTP ${status}`);
+  }
+
+  const text = extractTextFromGeminiPayload(data);
+  if (!text) {
+    throw new Error('Empty response from Gemini Interactions API');
+  }
+  return { text, interactionId: data.id };
 }
 
 async function callGeminiGenerateContent(
@@ -167,39 +178,23 @@ async function callGeminiGenerateContent(
     model
   )}:generateContent`;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 25000);
+  const { ok, status, data } = await postGeminiJson<GenerateContentResponse>(url, apiKey, {
+    systemInstruction: { parts: [{ text: systemInstruction }] },
+    contents: [{ role: 'user', parts: [{ text: input }] }],
+    generationConfig: expectJson
+      ? { temperature: 0.4, responseMimeType: 'application/json' }
+      : { temperature: 0.4 },
+  });
 
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
-      },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemInstruction }] },
-        contents: [{ role: 'user', parts: [{ text: input }] }],
-        generationConfig: expectJson
-          ? { temperature: 0.4, responseMimeType: 'application/json' }
-          : { temperature: 0.4 },
-      }),
-      signal: controller.signal,
-    });
-
-    const data = (await res.json()) as GenerateContentResponse;
-    if (!res.ok) {
-      throw new Error(data.error?.message || `Gemini API returned HTTP ${res.status}`);
-    }
-
-    const text = extractTextFromGeminiPayload(data);
-    if (!text) {
-      throw new Error('Empty response from Gemini API');
-    }
-    return text;
-  } finally {
-    clearTimeout(timer);
+  if (!ok) {
+    throw new Error(data.error?.message || `Gemini API returned HTTP ${status}`);
   }
+
+  const text = extractTextFromGeminiPayload(data);
+  if (!text) {
+    throw new Error('Empty response from Gemini API');
+  }
+  return text;
 }
 
 function sanitizeItems(

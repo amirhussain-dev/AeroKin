@@ -16,6 +16,7 @@ import {
   extractTextFromGeminiPayload,
   parseJsonLenient,
 } from '../server/geminiService.ts';
+import { clearOpenMeteoCaches } from '../server/airQualityService.ts';
 
 /**
  * Dispatches an in-memory HTTP request through the Express app without binding a TCP socket.
@@ -285,4 +286,126 @@ test('POST /api/plan and /api/chat fall back to scientific engine when mocked Ge
   assert.ok(chatBody.reply.content.includes('Corsi-Rosenthal'));
   assert.match(String(chatBody.warning), /Gemini chat fallback \(Mocked Gemini 503 outage\)/);
   assert.equal(fetchMock.mock.callCount(), 2);
+});
+
+test('Open-Meteo live feed deduplicates concurrent/repeated fetches without leaking pm25Override or caching errors', async (t) => {
+  clearOpenMeteoCaches();
+  const app = createApp();
+  let aqCalls = 0;
+  let wxCalls = 0;
+  let shouldFail = false;
+
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    if (shouldFail) {
+      return new Response(JSON.stringify({ error: 'Open-Meteo down' }), { status: 500 });
+    }
+    if (url.includes('air-quality-api.open-meteo.com')) {
+      aqCalls++;
+      return new Response(
+        JSON.stringify({
+          current: { pm2_5: 218, pm10: 340, us_aqi: 268 },
+          hourly: {
+            time: Array.from({ length: 24 }, (_, i) => `2026-11-27T${String(i).padStart(2, '0')}:00`),
+            pm2_5: Array.from({ length: 24 }, (_, i) => (i >= 12 && i <= 15 ? 115 : 240)),
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    }
+    if (url.includes('api.open-meteo.com/v1/forecast')) {
+      wxCalls++;
+      return new Response(
+        JSON.stringify({ current: { temperature_2m: 11, relative_humidity_2m: 78, wind_speed_10m: 4 } }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    }
+    throw new Error(`Unexpected fetch URL: ${url}`);
+  });
+
+  // Two concurrent live-feed plan requests for Delhi-NCR should share one upstream Open-Meteo fetch pair
+  const [res1, res2] = await Promise.all([
+    invokeApp(app, 'POST', '/api/plan', {
+      profile: { ...DEFAULT_PROFILE, locationId: 'delhi', roomAreaSqm: 40 },
+      useLiveFeed: true,
+    }),
+    invokeApp(app, 'POST', '/api/plan', {
+      profile: { ...DEFAULT_PROFILE, locationId: 'delhi', roomAreaSqm: 45, pm25Override: 180 },
+      useLiveFeed: true,
+    }),
+  ]);
+
+  assert.equal(res1.status, 200);
+  assert.equal(res2.status, 200);
+  assert.equal(aqCalls, 1);
+  assert.equal(wxCalls, 1);
+  assert.equal((res1.json.location as { pm25: number }).pm25, 218);
+  assert.equal((res2.json.location as { pm25: number }).pm25, 180);
+
+  // Subsequent request for Delhi-NCR with different household size hits the coordinate cache (0 extra upstream calls)
+  const res3 = await invokeApp(app, 'POST', '/api/plan', {
+    profile: { ...DEFAULT_PROFILE, locationId: 'delhi', householdSize: 6 },
+    useLiveFeed: true,
+  });
+  assert.equal(res3.status, 200);
+  assert.equal(aqCalls, 1);
+  assert.equal(wxCalls, 1);
+
+  // Errors are not cached: when upstream fails, fallback model is returned and next healthy call retries Open-Meteo
+  clearOpenMeteoCaches();
+  shouldFail = true;
+  const errRes = await invokeApp(app, 'POST', '/api/plan', {
+    profile: { ...DEFAULT_PROFILE, locationId: 'delhi' },
+    useLiveFeed: true,
+  });
+  assert.equal(errRes.status, 200);
+  assert.match(String(errRes.json.airFeedNote), /curated regional winter smog model/i);
+
+  shouldFail = false;
+  const recoveredRes = await invokeApp(app, 'POST', '/api/plan', {
+    profile: { ...DEFAULT_PROFILE, locationId: 'delhi' },
+    useLiveFeed: true,
+  });
+  assert.equal(recoveredRes.status, 200);
+  assert.equal((recoveredRes.json.location as { isLive?: boolean }).isLive, true);
+  assert.equal(aqCalls, 2);
+  assert.equal(wxCalls, 2);
+  clearOpenMeteoCaches();
+});
+
+test('local simulateImpact matches /api/simulate across rapid slider values and invalid profiles fail cleanly', async () => {
+  const app = createApp();
+  const profile = { ...DEFAULT_PROFILE, locationId: 'delhi', roomAreaSqm: 40 };
+  const plan = buildScientificPlan(profile);
+  const selectedIds = [plan.routines[0].id, plan.iaqHacks[0].id];
+
+  const sliderValues = [1, 25, 75, 150, 300, 500];
+  const localSimResults = sliderValues.map((count) => simulateImpact(profile, plan, selectedIds, count));
+  const finalLocal = localSimResults[localSimResults.length - 1];
+
+  const serverRes = await invokeApp(app, 'POST', '/api/simulate', {
+    profile,
+    plan,
+    selectedIds,
+    communityFamiliesCount: 500,
+  });
+  assert.equal(serverRes.status, 200);
+  assert.deepEqual(serverRes.json, finalLocal);
+
+  const badSimRes = await invokeApp(app, 'POST', '/api/simulate', {
+    profile: { ...profile, roomAreaSqm: -5 },
+    plan,
+    selectedIds,
+    communityFamiliesCount: 25,
+  });
+  assert.equal(badSimRes.status, 400);
+  assert.match(String(badSimRes.json.error), /roomAreaSqm/);
+
+  const badChatRes = await invokeApp(app, 'POST', '/api/chat', {
+    profile: 'invalid-profile',
+    plan,
+    message: 'hello',
+  });
+  assert.equal(badChatRes.status, 400);
+  assert.match(String(badChatRes.json.error), /Invalid profile/);
 });

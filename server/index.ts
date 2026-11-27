@@ -25,20 +25,75 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+class ValidationError extends Error {}
+
+function extractGeminiHeaders(req: express.Request): { apiKey: string; model: string } {
+  const apiKey =
+    typeof req.headers['x-gemini-api-key'] === 'string' ? req.headers['x-gemini-api-key'].trim() : '';
+  const rawModel =
+    typeof req.headers['x-gemini-model'] === 'string' ? req.headers['x-gemini-model'].trim() : '';
+  return {
+    apiKey,
+    model: rawModel || DEFAULT_GEMINI_MODEL,
+  };
+}
+
+function parseProfile(rawProfile: unknown): HouseholdProfile {
+  if (
+    rawProfile !== undefined &&
+    (typeof rawProfile !== 'object' || rawProfile === null || Array.isArray(rawProfile))
+  ) {
+    throw new ValidationError('Invalid profile: expected an object');
+  }
+
+  const profile: HouseholdProfile = {
+    ...DEFAULT_PROFILE,
+    ...((rawProfile as Partial<HouseholdProfile> | undefined) || {}),
+  };
+
+  if (typeof profile.roomAreaSqm !== 'number' || !Number.isFinite(profile.roomAreaSqm) || profile.roomAreaSqm <= 0) {
+    throw new ValidationError('Invalid roomAreaSqm: must be a positive number');
+  }
+  if (typeof profile.householdSize !== 'number' || !Number.isFinite(profile.householdSize) || profile.householdSize < 1) {
+    throw new ValidationError('Invalid householdSize: must be at least 1');
+  }
+  if (
+    typeof profile.commuteKmRoundTrip !== 'number' ||
+    !Number.isFinite(profile.commuteKmRoundTrip) ||
+    profile.commuteKmRoundTrip < 0
+  ) {
+    throw new ValidationError('Invalid commuteKmRoundTrip: must be a non-negative number');
+  }
+  if (
+    profile.pm25Override !== null &&
+    (typeof profile.pm25Override !== 'number' || !Number.isFinite(profile.pm25Override) || profile.pm25Override < 0)
+  ) {
+    throw new ValidationError('Invalid pm25Override: must be null or a non-negative number');
+  }
+
+  return profile;
+}
+
+function sendRouteError(res: express.Response, err: unknown, fallbackMessage: string): void {
+  const status = err instanceof ValidationError ? 400 : 500;
+  res.status(status).json({
+    error: err instanceof Error ? err.message : fallbackMessage,
+  });
+}
+
 export function createApp() {
   const app = express();
   app.use(cors());
   app.use(express.json({ limit: '1mb' }));
 
   app.get('/api/health', (req, res) => {
-    const headerKey = typeof req.headers['x-gemini-api-key'] === 'string' ? req.headers['x-gemini-api-key'].trim() : '';
-    const headerModel = typeof req.headers['x-gemini-model'] === 'string' ? req.headers['x-gemini-model'].trim() : '';
+    const { apiKey, model } = extractGeminiHeaders(req);
     const hasEnvKey = Boolean(process.env.GEMINI_API_KEY?.trim());
     res.json({
       ok: true,
-      geminiConfigured: hasEnvKey || Boolean(headerKey),
-      geminiSource: headerKey ? 'session' : hasEnvKey ? 'env' : 'none',
-      model: headerModel || DEFAULT_GEMINI_MODEL,
+      geminiConfigured: hasEnvKey || Boolean(apiKey),
+      geminiSource: apiKey ? 'session' : hasEnvKey ? 'env' : 'none',
+      model,
     });
   });
 
@@ -51,50 +106,9 @@ export function createApp() {
 
   app.post('/api/plan', async (req, res) => {
     try {
-      const rawProfile = req.body?.profile;
-      if (
-        rawProfile !== undefined &&
-        (typeof rawProfile !== 'object' || rawProfile === null || Array.isArray(rawProfile))
-      ) {
-        res.status(400).json({ error: 'Invalid profile: expected an object' });
-        return;
-      }
-
-      const profile: HouseholdProfile = {
-        ...DEFAULT_PROFILE,
-        ...(rawProfile || {}),
-      };
-
-      if (typeof profile.roomAreaSqm !== 'number' || !Number.isFinite(profile.roomAreaSqm) || profile.roomAreaSqm <= 0) {
-        res.status(400).json({ error: 'Invalid roomAreaSqm: must be a positive number' });
-        return;
-      }
-      if (typeof profile.householdSize !== 'number' || !Number.isFinite(profile.householdSize) || profile.householdSize < 1) {
-        res.status(400).json({ error: 'Invalid householdSize: must be at least 1' });
-        return;
-      }
-      if (
-        typeof profile.commuteKmRoundTrip !== 'number' ||
-        !Number.isFinite(profile.commuteKmRoundTrip) ||
-        profile.commuteKmRoundTrip < 0
-      ) {
-        res.status(400).json({ error: 'Invalid commuteKmRoundTrip: must be a non-negative number' });
-        return;
-      }
-      if (
-        profile.pm25Override !== null &&
-        (typeof profile.pm25Override !== 'number' || !Number.isFinite(profile.pm25Override) || profile.pm25Override < 0)
-      ) {
-        res.status(400).json({ error: 'Invalid pm25Override: must be null or a non-negative number' });
-        return;
-      }
+      const profile = parseProfile(req.body?.profile);
       const useLiveFeed = Boolean(req.body?.useLiveFeed);
-      const headerKey =
-        typeof req.headers['x-gemini-api-key'] === 'string' ? req.headers['x-gemini-api-key'] : undefined;
-      const headerModel =
-        typeof req.headers['x-gemini-model'] === 'string' && req.headers['x-gemini-model'].trim()
-          ? req.headers['x-gemini-model'].trim()
-          : DEFAULT_GEMINI_MODEL;
+      const { apiKey, model } = extractGeminiHeaders(req);
 
       let location = resolveLocation(profile);
       let airFeedNote = 'Using curated regional winter smog model.';
@@ -105,7 +119,7 @@ export function createApp() {
         airFeedNote = liveRes.note;
       }
 
-      const { plan, warning } = await generateTailoredPlan(profile, location, headerKey, headerModel);
+      const { plan, warning } = await generateTailoredPlan(profile, location, apiKey || undefined, model);
       res.json({
         location,
         plan,
@@ -113,77 +127,59 @@ export function createApp() {
         warning,
       });
     } catch (err) {
-      res.status(500).json({
-        error: err instanceof Error ? err.message : 'Failed to generate plan',
-      });
+      sendRouteError(res, err, 'Failed to generate plan');
     }
   });
 
   app.post('/api/simulate', (req, res) => {
     try {
-      const profile: HouseholdProfile = {
-        ...DEFAULT_PROFILE,
-        ...(req.body?.profile || {}),
-      };
+      const profile = parseProfile(req.body?.profile);
       const plan = req.body?.plan as AssistantPlan | undefined;
       const selectedIds = Array.isArray(req.body?.selectedIds) ? (req.body.selectedIds as string[]) : [];
       const communityFamiliesCount =
-        typeof req.body?.communityFamiliesCount === 'number' ? req.body.communityFamiliesCount : 25;
+        typeof req.body?.communityFamiliesCount === 'number' && Number.isFinite(req.body.communityFamiliesCount)
+          ? req.body.communityFamiliesCount
+          : 25;
 
-      if (!plan) {
-        res.status(400).json({ error: 'Missing plan in request body' });
-        return;
+      if (!plan || typeof plan !== 'object') {
+        throw new ValidationError('Missing plan in request body');
       }
 
       const result = simulateImpact(profile, plan, selectedIds, communityFamiliesCount);
       res.json(result);
     } catch (err) {
-      res.status(500).json({
-        error: err instanceof Error ? err.message : 'Failed to simulate impact',
-      });
+      sendRouteError(res, err, 'Failed to simulate impact');
     }
   });
 
   app.post('/api/chat', async (req, res) => {
     try {
-      const profile: HouseholdProfile = {
-        ...DEFAULT_PROFILE,
-        ...(req.body?.profile || {}),
-      };
+      const profile = parseProfile(req.body?.profile);
       const location = req.body?.location || resolveLocation(profile);
-      const plan = req.body?.plan as AssistantPlan;
+      const plan = req.body?.plan as AssistantPlan | undefined;
       const history = Array.isArray(req.body?.history) ? (req.body.history as ChatMessage[]) : [];
       const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
 
       if (!message) {
-        res.status(400).json({ error: 'Message cannot be empty' });
-        return;
+        throw new ValidationError('Message cannot be empty');
       }
-      if (!plan) {
-        res.status(400).json({ error: 'Plan context is required' });
-        return;
+      if (!plan || typeof plan !== 'object') {
+        throw new ValidationError('Plan context is required');
       }
 
-      const headerKey =
-        typeof req.headers['x-gemini-api-key'] === 'string' ? req.headers['x-gemini-api-key'] : undefined;
-      const headerModel =
-        typeof req.headers['x-gemini-model'] === 'string' && req.headers['x-gemini-model'].trim()
-          ? req.headers['x-gemini-model'].trim()
-          : DEFAULT_GEMINI_MODEL;
+      const { apiKey, model } = extractGeminiHeaders(req);
       const { reply, warning } = await generateChatResponse(
         profile,
         location,
         plan,
         history,
         message,
-        headerKey,
-        headerModel
+        apiKey || undefined,
+        model
       );
       res.json({ reply, warning });
     } catch (err) {
-      res.status(500).json({
-        error: err instanceof Error ? err.message : 'Failed to generate chat response',
-      });
+      sendRouteError(res, err, 'Failed to generate chat response');
     }
   });
 

@@ -257,12 +257,16 @@ export const DEFAULT_PROFILE: HouseholdProfile = {
   budgetTier: 'low_budget',
 };
 
+export function resolveOutdoorPm25(profile: HouseholdProfile, baseLocation?: LocationProfile): number {
+  const base = baseLocation ?? LOCATION_PRESETS.find((l) => l.id === profile.locationId) ?? LOCATION_PRESETS[0];
+  return profile.pm25Override !== null && Number.isFinite(profile.pm25Override)
+    ? Math.max(5, Math.min(600, Math.round(profile.pm25Override)))
+    : base.pm25;
+}
+
 export function resolveLocation(profile: HouseholdProfile): LocationProfile {
   const base = LOCATION_PRESETS.find((l) => l.id === profile.locationId) ?? LOCATION_PRESETS[0];
-  const effectivePm25 =
-    profile.pm25Override !== null && Number.isFinite(profile.pm25Override)
-      ? Math.max(5, Math.min(600, Math.round(profile.pm25Override)))
-      : base.pm25;
+  const effectivePm25 = resolveOutdoorPm25(profile, base);
 
   const effectiveInversion: LocationProfile['inversionRisk'] =
     effectivePm25 >= 150 ? 'Severe' : effectivePm25 >= 65 ? 'High' : effectivePm25 >= 35 ? 'Moderate' : 'Low';
@@ -699,7 +703,8 @@ export function simulateImpact(
     ...plan.sustainableAlternatives,
     ...plan.communityActions,
   ];
-  const selected = allItems.filter((item) => selectedIds.includes(item.id));
+  const selectedSet = new Set(selectedIds);
+  const selected = allItems.filter((item) => selectedSet.has(item.id));
 
   let remainingIndoorFraction = 1;
   let extraExposureSavedUg = 0;
@@ -720,7 +725,7 @@ export function simulateImpact(
   const indoorDropPct = Math.round(((baselineIndoor - projectedIndoor) / Math.max(1, baselineIndoor)) * 100);
 
   // Average adult/child daily inhaled volume ~14 m³/day (weighted ~11 m³ indoors + ~3 m³ outdoors)
-  const outdoorPm25 = resolveLocation(profile).pm25;
+  const outdoorPm25 = resolveOutdoorPm25(profile);
   const baselineDailyInhaledUg = Math.round(baselineIndoor * 11 + outdoorPm25 * 3);
   const indoorSavedUg = Math.max(0, (baselineIndoor - projectedIndoor) * 11);
   const totalSavedUg = Math.min(baselineDailyInhaledUg * 0.85, indoorSavedUg + extraExposureSavedUg * 0.45);
