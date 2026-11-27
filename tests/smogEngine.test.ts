@@ -24,7 +24,8 @@ async function invokeApp(
   app: ReturnType<typeof createApp>,
   method: string,
   url: string,
-  body?: unknown
+  body?: unknown,
+  headers: Record<string, string> = {}
 ): Promise<{ status: number; json: Record<string, unknown> }> {
   return new Promise((resolve, reject) => {
     const rawBody = body !== undefined ? Buffer.from(JSON.stringify(body), 'utf8') : null;
@@ -38,8 +39,9 @@ async function invokeApp(
       ? {
           'content-type': 'application/json',
           'content-length': String(rawBody.length),
+          ...headers,
         }
-      : {};
+      : { ...headers };
 
     const res = new http.ServerResponse(req);
     const chunks: Buffer[] = [];
@@ -197,4 +199,90 @@ test('Gemini Interactions API payload extractor and lenient JSON parser handle s
     candidates: [{ content: { parts: [{ text: '{"ok":true}' }] } }],
   };
   assert.equal(extractTextFromGeminiPayload(legacyPayload), '{"ok":true}');
+});
+
+test('POST /api/plan rejects invalid profile payloads with 400', async () => {
+  const app = createApp();
+
+  const nonObjectRes = await invokeApp(app, 'POST', '/api/plan', {
+    profile: 'not-an-object',
+  });
+  assert.equal(nonObjectRes.status, 400);
+  assert.match(String(nonObjectRes.json.error), /Invalid profile/);
+
+  const badRoomRes = await invokeApp(app, 'POST', '/api/plan', {
+    profile: { ...DEFAULT_PROFILE, roomAreaSqm: -10 },
+  });
+  assert.equal(badRoomRes.status, 400);
+  assert.match(String(badRoomRes.json.error), /roomAreaSqm/);
+
+  const badHouseholdRes = await invokeApp(app, 'POST', '/api/plan', {
+    profile: { ...DEFAULT_PROFILE, householdSize: 0 },
+  });
+  assert.equal(badHouseholdRes.status, 400);
+  assert.match(String(badHouseholdRes.json.error), /householdSize/);
+
+  const badPm25Res = await invokeApp(app, 'POST', '/api/plan', {
+    profile: { ...DEFAULT_PROFILE, pm25Override: -5 },
+  });
+  assert.equal(badPm25Res.status, 400);
+  assert.match(String(badPm25Res.json.error), /pm25Override/);
+});
+
+test('POST /api/plan and /api/chat fall back to scientific engine when mocked Gemini API fails', async (t) => {
+  const app = createApp();
+  const fetchMock = t.mock.method(globalThis, 'fetch', async () => {
+    return new Response(
+      JSON.stringify({ error: { message: 'Mocked Gemini 503 outage' } }),
+      {
+        status: 503,
+        headers: { 'content-type': 'application/json' },
+      }
+    );
+  });
+
+  const planRes = await invokeApp(
+    app,
+    'POST',
+    '/api/plan',
+    {
+      profile: { ...DEFAULT_PROFILE, locationId: 'delhi' },
+      useLiveFeed: false,
+    },
+    { 'x-gemini-api-key': 'mock-test-key' }
+  );
+
+  assert.equal(planRes.status, 200);
+  const planBody = planRes.json as {
+    location: { name: string };
+    plan: ReturnType<typeof buildScientificPlan>;
+    warning?: string;
+  };
+  assert.equal(planBody.plan.source, 'scientific_engine');
+  assert.equal(planBody.plan.routines.length, 4);
+  assert.match(String(planBody.warning), /Gemini unavailable \(Mocked Gemini 503 outage\)/);
+
+  const chatRes = await invokeApp(
+    app,
+    'POST',
+    '/api/chat',
+    {
+      profile: DEFAULT_PROFILE,
+      location: planBody.location,
+      plan: planBody.plan,
+      history: [],
+      message: 'How do I build a cheap DIY air purifier?',
+    },
+    { 'x-gemini-api-key': 'mock-test-key' }
+  );
+
+  assert.equal(chatRes.status, 200);
+  const chatBody = chatRes.json as {
+    reply: { source: string; content: string };
+    warning?: string;
+  };
+  assert.equal(chatBody.reply.source, 'scientific_engine');
+  assert.ok(chatBody.reply.content.includes('Corsi-Rosenthal'));
+  assert.match(String(chatBody.warning), /Gemini chat fallback \(Mocked Gemini 503 outage\)/);
+  assert.equal(fetchMock.mock.callCount(), 2);
 });

@@ -51,10 +51,43 @@ export function createApp() {
 
   app.post('/api/plan', async (req, res) => {
     try {
+      const rawProfile = req.body?.profile;
+      if (
+        rawProfile !== undefined &&
+        (typeof rawProfile !== 'object' || rawProfile === null || Array.isArray(rawProfile))
+      ) {
+        res.status(400).json({ error: 'Invalid profile: expected an object' });
+        return;
+      }
+
       const profile: HouseholdProfile = {
         ...DEFAULT_PROFILE,
-        ...(req.body?.profile || {}),
+        ...(rawProfile || {}),
       };
+
+      if (typeof profile.roomAreaSqm !== 'number' || !Number.isFinite(profile.roomAreaSqm) || profile.roomAreaSqm <= 0) {
+        res.status(400).json({ error: 'Invalid roomAreaSqm: must be a positive number' });
+        return;
+      }
+      if (typeof profile.householdSize !== 'number' || !Number.isFinite(profile.householdSize) || profile.householdSize < 1) {
+        res.status(400).json({ error: 'Invalid householdSize: must be at least 1' });
+        return;
+      }
+      if (
+        typeof profile.commuteKmRoundTrip !== 'number' ||
+        !Number.isFinite(profile.commuteKmRoundTrip) ||
+        profile.commuteKmRoundTrip < 0
+      ) {
+        res.status(400).json({ error: 'Invalid commuteKmRoundTrip: must be a non-negative number' });
+        return;
+      }
+      if (
+        profile.pm25Override !== null &&
+        (typeof profile.pm25Override !== 'number' || !Number.isFinite(profile.pm25Override) || profile.pm25Override < 0)
+      ) {
+        res.status(400).json({ error: 'Invalid pm25Override: must be null or a non-negative number' });
+        return;
+      }
       const useLiveFeed = Boolean(req.body?.useLiveFeed);
       const headerKey =
         typeof req.headers['x-gemini-api-key'] === 'string' ? req.headers['x-gemini-api-key'] : undefined;
